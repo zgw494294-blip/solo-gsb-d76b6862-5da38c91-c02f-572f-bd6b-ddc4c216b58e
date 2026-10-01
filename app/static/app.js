@@ -76,6 +76,8 @@ function updateBusy() {
 /* ---------------------------------------------------------------- 档案库 */
 
 let archiveSubmitting = false; // 归档请求在途，禁用提交防止重复建档案
+let currentDetail = null;      // 当前查看的档案详情（"以此开新场"使用）
+let startSubmitting = false;   // 以此开新场请求在途，禁用提交防重复
 
 function statusLabel(status) {
   return status === "done" ? "已完成" : "提前收场";
@@ -101,6 +103,7 @@ async function apiGetJson(path) {
 }
 
 async function loadArchiveList() {
+  currentDetail = null;
   $("#archives-title").textContent = "📚 档案库";
   $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
   let data;
@@ -145,6 +148,9 @@ async function loadArchiveDetail(id) {
       <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
     return;
   }
+  currentDetail = a;
+  const total = a.issued.length + a.pending.length;
+  const canStart = state && state.status === "setup";
   $("#archives-body").innerHTML = `
     <div class="archive-detail-head">
       <div class="archive-detail-name">${escapeHtml(a.name)}</div>
@@ -178,7 +184,16 @@ async function loadArchiveDetail(id) {
         </ul>
       </div>
     </div>
-    <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    <div class="actions">
+      <button data-action="archive-list">← 返回列表</button>
+      <button id="start-from-archive" class="primary" data-action="start-from-archive"
+        ${canStart ? "" : "disabled"}>以此开新场 ▶</button>
+    </div>
+    <p class="hint">
+      ${canStart
+        ? `将按<b>已发顺序</b>取 ${a.issued.length} 条编号与内容快照，再接<b>待发顺序</b>的 ${a.pending.length} 条，共 ${total} 条全部作为新场待发提示；不继承发出时间或进度，原档案保持不变。`
+        : "仅开场前（设置页）可以此开新场；当前场次进行中，请先收场或重新开始。"}
+    </p>`;
 }
 
 function openArchiveForm() {
@@ -237,6 +252,59 @@ async function submitArchive() {
   } finally {
     archiveSubmitting = false;
     updateBusy();
+  }
+}
+
+async function submitStartFromArchive() {
+  if (startSubmitting || !currentDetail) return;
+  if (!state || state.status !== "setup") {
+    toast("仅开场前可以此开新场");
+    return;
+  }
+  const a = currentDetail;
+  const total = a.issued.length + a.pending.length;
+  const ok = confirm(
+    `将以档案「${a.name}」开新场：\n` +
+    `先按已发顺序取 ${a.issued.length} 条（编号与发出时内容快照），` +
+    `再接待发顺序的 ${a.pending.length} 条，共 ${total} 条，全部作为待发提示。\n\n` +
+    "不继承发出时间或进度，原档案不变。确认开始新场吗？"
+  );
+  if (!ok) return;
+  startSubmitting = true;
+  const btn = $("#start-from-archive");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/archives/" + encodeURIComponent(a.id) + "/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version: state.version }),
+    });
+    const data = await res.json();
+    if (res.status === 409) {
+      applyState(data.state);
+      closeArchivesModal();
+      toast("开新场未生效：非开场前或版本已过期，页面已刷新");
+      return;
+    }
+    if (res.status === 404) {
+      toast("档案不存在，可能已被删除");
+      closeArchivesModal();
+      return;
+    }
+    if (!res.ok) {
+      toast(data.error || "开新场失败");
+      if (btn) btn.disabled = false;
+      return;
+    }
+    // 新场提示已写入且状态一并推进（同一事务）
+    applyState(data);
+    closeArchivesModal();
+    toast(`已按档案「${a.name}」开始新场，共 ${total} 条待发提示`);
+  } catch (err) {
+    toast("网络错误：" + err.message);
+    if (btn) btn.disabled = false;
+  } finally {
+    startSubmitting = false;
   }
 }
 
@@ -456,6 +524,8 @@ $("#archives-body").addEventListener("click", (e) => {
     submitArchive();
   } else if (action === "archive-detail") {
     loadArchiveDetail(Number(btn.dataset.id));
+  } else if (action === "start-from-archive") {
+    submitStartFromArchive();
   }
 });
 

@@ -1,10 +1,11 @@
 """舞台提示执行台 —— FastAPI + SQLite 后端。
 
-并发模型：所有写操作（确认 / 编辑 / 重排 / 归档 / 设置 / 重置）都在同一把锁内
-串行完成；其中带版本号的操作（确认 / 编辑 / 重排 / 归档）在锁内完成
-"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
-只会有一个生效，另一个收到 409 及最新状态。归档的"写档案 + 清空提示"
-在同一事务内提交，写档案失败时不会清空当前提示。
+并发模型：所有写操作（确认 / 编辑 / 重排 / 归档 / 设置 / 重置 /
+以档案开新场）都在同一把锁内串行完成；其中带版本号的操作（确认 /
+编辑 / 重排 / 归档 / 以档案开新场）在锁内完成"检查版本号 -> 修改数据"
+两个步骤，因此同一版本号上并发的两个操作只会有一个生效，另一个收到
+409 及最新状态。归档的"写档案 + 清空提示"、以档案开新场的
+"写入新场提示 + 推进状态"都在同一事务内提交，任一步失败整体回滚。
 """
 import json
 import os
@@ -137,6 +138,23 @@ def bad_request(message: str) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": message})
 
 
+def cue_list_error(cues: list[tuple[str, str]]) -> Optional[str]:
+    """校验提示清单：2～12 条、编号唯一非空、内容非空。
+
+    入参为 (number, content) 对；通过返回 None，失败返回中文错误说明。
+    """
+    if not (MIN_CUES <= len(cues) <= MAX_CUES):
+        return f"提示数量需在 {MIN_CUES}～{MAX_CUES} 条之间"
+    numbers = [n.strip() for n, _ in cues]
+    if any(not n for n in numbers):
+        return "编号不能为空"
+    if len(set(numbers)) != len(numbers):
+        return "编号必须唯一"
+    if any(not c.strip() for _, c in cues):
+        return "内容不能为空"
+    return None
+
+
 # ---------------------------------------------------------------- 档案组装
 
 def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict]]:
@@ -186,6 +204,16 @@ def archive_detail(row: sqlite3.Row) -> dict:
     }
 
 
+def archive_cues(row: sqlite3.Row) -> list[tuple[str, str]]:
+    """档案转新场提示：先按已发顺序取编号与内容快照，再接按待发顺序的
+    编号与内容；不继承发出时间或进度（全部作为新场待发提示）。"""
+    issued = json.loads(row["issued"])
+    pending = json.loads(row["pending"])
+    return [(c["number"], c["content"]) for c in issued] + [
+        (c["number"], c["content"]) for c in pending
+    ]
+
+
 # ---------------------------------------------------------------- 应用
 
 @asynccontextmanager
@@ -227,6 +255,10 @@ class ReorderIn(BaseModel):
     order: list[int]
 
 
+class StartFromArchiveIn(BaseModel):
+    version: int
+
+
 @app.get("/api/state")
 def get_state():
     with db() as conn:
@@ -257,17 +289,12 @@ def get_archive(archive_id: int):
 @app.post("/api/setup")
 def setup(body: SetupIn):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
-    cues = body.cues
-    if not (MIN_CUES <= len(cues) <= MAX_CUES):
-        return bad_request(f"提示数量需在 {MIN_CUES}～{MAX_CUES} 条之间")
-    numbers = [c.number.strip() for c in cues]
-    contents = [c.content.strip() for c in cues]
-    if any(not n for n in numbers):
-        return bad_request("编号不能为空")
-    if len(set(numbers)) != len(numbers):
-        return bad_request("编号必须唯一")
-    if any(not c for c in contents):
-        return bad_request("内容不能为空")
+    cues = [(c.number, c.content) for c in body.cues]
+    error = cue_list_error(cues)
+    if error:
+        return bad_request(error)
+    numbers = [n.strip() for n, _ in cues]
+    contents = [c.strip() for _, c in cues]
 
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
@@ -419,6 +446,51 @@ def archive(body: ArchiveIn):
         conn.execute(
             "UPDATE meta SET version = ?, status = 'setup' WHERE id = 1",
             (new_version,),
+        )
+        return build_state(conn)
+
+
+@app.post("/api/archives/{archive_id}/start")
+def start_from_archive(archive_id: int, body: StartFromArchiveIn):
+    """以档案开新场。
+
+    按档案已发顺序取编号与内容快照，再接待发顺序的编号与内容，全部作为
+    新场待发提示；不继承发出时间或进度，也不修改原档案。仅开场前
+    （setup）允许生效，携带页面所见版本号。"写入新场提示 + 推进到演出中
+    + 版本号 +1"在同一事务内提交：任一步失败整体回滚，当前场次与档案都
+    不变。同版本的重复/并发提交只有一次生效，其余收到 409 及最新状态。
+
+    档案不存在返回 404；拼出的提示不满足 2～12 条 / 编号唯一 / 内容非空
+    返回 400；非开场前或版本过期返回 409。
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM archives WHERE id = ?", (archive_id,)
+        ).fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "archive_not_found"})
+
+    cues = archive_cues(row)
+    error = cue_list_error(cues)
+    if error:
+        return bad_request(error)
+    numbers = [n.strip() for n, _ in cues]
+    contents = [c.strip() for _, c in cues]
+
+    with lock, db() as conn:
+        meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
+        if meta["status"] != "setup" or body.version != meta["version"]:
+            return conflict(conn)
+
+        conn.execute("DELETE FROM cues")
+        for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
+            conn.execute(
+                "INSERT INTO cues (number, content, position, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (number, content, pos),
+            )
+        conn.execute(
+            "UPDATE meta SET version = version + 1, status = 'live' WHERE id = 1"
         )
         return build_state(conn)
 
