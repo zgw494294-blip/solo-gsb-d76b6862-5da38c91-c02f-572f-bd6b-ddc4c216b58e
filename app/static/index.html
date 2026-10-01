@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>舞台提示执行台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>🎭 舞台提示执行台</h1>
+    <div class="header-ops">
+      <button id="archives-btn" class="ghost">📚 档案库</button>
+      <span id="version-badge" title="状态版本号">v0</span>
+    </div>
+  </header>
+
+  <div id="toast" role="status"></div>
+
+  <!-- 开场前设置 -->
+  <section id="setup-view" class="hidden">
+    <h2>开场前设置</h2>
+    <p class="hint">按发出顺序录入 <b>2～12</b> 条提示，每条需有<b>唯一编号</b>和<b>非空内容</b>。</p>
+    <div id="cue-rows"></div>
+    <div class="actions">
+      <button id="add-row">＋ 添加一条</button>
+      <button id="start-show" class="primary">开始演出 ▶</button>
+    </div>
+  </section>
+
+  <!-- 演出中 -->
+  <section id="live-view" class="hidden">
+    <div id="done-banner" class="hidden">✅ 全部提示已发出，本场提示执行完毕！</div>
+
+    <div class="topbar">
+      <span id="progress"></span>
+      <span class="topbar-ops">
+        <button id="archive-btn" class="warning-outline">归档本场 🗂</button>
+        <button id="reset-btn" class="danger-outline">重新开始</button>
+      </span>
+    </div>
+
+    <div class="columns">
+      <div class="col-main">
+        <div id="current-card" class="card"></div>
+        <div id="next-card" class="card muted"></div>
+
+        <h3>待发出 <span class="hint-inline">（可改写、可重排）</span></h3>
+        <ul id="pending-list" class="cue-list"></ul>
+      </div>
+
+      <div class="col-side">
+        <h3>已发记录</h3>
+        <ul id="issued-list" class="cue-list"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 档案库弹窗：列表 / 详情 / 归档表单 -->
+  <div id="archives-modal" class="overlay hidden">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="档案库">
+      <div class="modal-head">
+        <h2 id="archives-title">📚 档案库</h2>
+        <button id="archives-close" class="ghost" title="关闭">✕</button>
+      </div>
+      <div id="archives-body"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
