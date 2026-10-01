@@ -1,10 +1,12 @@
 """舞台提示执行台 —— FastAPI + SQLite 后端。
 
-并发模型：所有写操作（确认 / 编辑 / 重排 / 归档 / 设置 / 重置）都在同一把锁内
-串行完成；其中带版本号的操作（确认 / 编辑 / 重排 / 归档）在锁内完成
-"检查版本号 -> 修改数据"两个步骤，因此同一版本号上并发的两个操作
-只会有一个生效，另一个收到 409 及最新状态。归档的"写档案 + 清空提示"
-在同一事务内提交，写档案失败时不会清空当前提示。
+并发模型：所有写操作（确认 / 编辑 / 重排 / 归档 / 设置 / 重置 / 以档开新场）
+都在同一把锁内串行完成；其中带版本号的操作（确认 / 编辑 / 重排 / 归档 /
+以档开新场）在锁内完成"检查版本号 -> 修改数据"两个步骤，因此同一版本号上
+并发的两个操作只会有一个生效，另一个收到 409 及最新状态。归档的
+"写档案 + 清空提示"、以档开新场的"写入新场提示 + 推进状态"都在同一事务内
+提交，任一步失败整体回滚，不会出现档案没存上却清空提示、或状态已推进却
+没写入提示的中间态。
 """
 import json
 import os
@@ -137,6 +139,25 @@ def bad_request(message: str) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": message})
 
 
+def validate_cues(items: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """校验 2~12 条 (编号, 内容)：数量、编号非空且唯一、内容非空。
+
+    成功返回 (去空格后的编号列表, 去空格后的内容列表)；
+    失败抛出 ValueError，消息可直接返回给调用方。
+    """
+    if not (MIN_CUES <= len(items) <= MAX_CUES):
+        raise ValueError(f"提示数量需在 {MIN_CUES}～{MAX_CUES} 条之间")
+    numbers = [str(n).strip() for n, _ in items]
+    contents = [str(c).strip() for _, c in items]
+    if any(not n for n in numbers):
+        raise ValueError("编号不能为空")
+    if len(set(numbers)) != len(numbers):
+        raise ValueError("编号必须唯一")
+    if any(not c for c in contents):
+        raise ValueError("内容不能为空")
+    return numbers, contents
+
+
 # ---------------------------------------------------------------- 档案组装
 
 def archive_snapshots(conn: sqlite3.Connection) -> tuple[list[dict], list[dict]]:
@@ -215,6 +236,10 @@ class ArchiveIn(BaseModel):
     name: str
 
 
+class StartFromArchiveIn(BaseModel):
+    version: int
+
+
 class EditIn(BaseModel):
     version: int
     cue_id: int
@@ -257,17 +282,10 @@ def get_archive(archive_id: int):
 @app.post("/api/setup")
 def setup(body: SetupIn):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
-    cues = body.cues
-    if not (MIN_CUES <= len(cues) <= MAX_CUES):
-        return bad_request(f"提示数量需在 {MIN_CUES}～{MAX_CUES} 条之间")
-    numbers = [c.number.strip() for c in cues]
-    contents = [c.content.strip() for c in cues]
-    if any(not n for n in numbers):
-        return bad_request("编号不能为空")
-    if len(set(numbers)) != len(numbers):
-        return bad_request("编号必须唯一")
-    if any(not c for c in contents):
-        return bad_request("内容不能为空")
+    try:
+        numbers, contents = validate_cues([(c.number, c.content) for c in body.cues])
+    except ValueError as exc:
+        return bad_request(str(exc))
 
     with lock, db() as conn:
         conn.execute("DELETE FROM cues")
@@ -418,6 +436,58 @@ def archive(body: ArchiveIn):
         conn.execute("DELETE FROM cues")
         conn.execute(
             "UPDATE meta SET version = ?, status = 'setup' WHERE id = 1",
+            (new_version,),
+        )
+        return build_state(conn)
+
+
+@app.post("/api/archives/{archive_id}/start")
+def start_from_archive(archive_id: int, body: StartFromArchiveIn):
+    """以一条已归档演出开新场（仅开场前 setup 可生效）。
+
+    新场的待发提示 = 档案中按发出顺序排列的已发（取编号与内容快照，
+    不继承发出时间/进度）+ 按待发顺序排列的剩余编号与内容，全部作为
+    新场待发提示，当前指向第一条，成功后进入演出中（live）、已发为空、
+    版本号 +1。原档案不做任何修改。
+
+    - 非开场前或版本过期：409 + 最新状态（优先判定，避免在演出中误建场）；
+    - 档案不存在：404；
+    - 合并后不满足 2~12 条 / 编号唯一 / 内容非空：400。
+    所有提示写入与状态推进在同一事务内提交，任一步失败整体回滚，
+    当前场次与档案都不变；同版本的重复/并发提交因版本不再匹配只有一个成功。
+    """
+    with lock, db() as conn:
+        meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
+        if meta["status"] != "setup" or body.version != meta["version"]:
+            return conflict(conn)
+
+        row = conn.execute(
+            "SELECT * FROM archives WHERE id = ?", (archive_id,)
+        ).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=404, content={"error": "archive_not_found"}
+            )
+
+        issued = json.loads(row["issued"])
+        pending = json.loads(row["pending"])
+        items = [(c["number"], c["content"]) for c in issued]
+        items += [(c["number"], c["content"]) for c in pending]
+        try:
+            numbers, contents = validate_cues(items)
+        except ValueError as exc:
+            return bad_request(str(exc))
+
+        new_version = meta["version"] + 1
+        conn.execute("DELETE FROM cues")
+        for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
+            conn.execute(
+                "INSERT INTO cues (number, content, position, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (number, content, pos),
+            )
+        conn.execute(
+            "UPDATE meta SET version = ?, status = 'live' WHERE id = 1",
             (new_version,),
         )
         return build_state(conn)

@@ -145,6 +145,7 @@ async function loadArchiveDetail(id) {
       <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
     return;
   }
+  const canStart = !!(state && state.status === "setup");
   $("#archives-body").innerHTML = `
     <div class="archive-detail-head">
       <div class="archive-detail-name">${escapeHtml(a.name)}</div>
@@ -178,7 +179,113 @@ async function loadArchiveDetail(id) {
         </ul>
       </div>
     </div>
-    <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    <div class="actions">
+      <button data-action="archive-list">← 返回列表</button>
+      ${canStart
+        ? `<button class="primary" data-action="start-from-archive" data-id="${a.id}">以此开新场 ▶</button>`
+        : `<button disabled title="回到开场前设置后才能以此开新场">以此开新场 ▶</button>`}
+    </div>
+    ${canStart
+      ? ""
+      : `<p class="hint-inline">当前已有进行中的场次；需回到「开场前设置」（重新开始或归档收场后）才能以此档案开新场。</p>`}`;
+}
+
+/* ------------------------------------------------------------ 以此开新场 */
+
+let startSubmitting = false; // 以档开新场请求在途，禁用提交防止重复
+
+/* 新场待发 = 档案已发（按发出顺序，取编号+内容快照）+ 剩余未发（按待发顺序）。
+ * 不继承发出时间或进度；原档案不修改。 */
+function startCues(a) {
+  return [
+    ...a.issued.map((c) => ({ number: c.number, content: c.content, src: "issued" })),
+    ...a.pending.map((c) => ({ number: c.number, content: c.content, src: "pending" })),
+  ];
+}
+
+function startCueIssues(cues) {
+  if (cues.length < state.min_cues || cues.length > state.max_cues) {
+    return [`合并后共 ${cues.length} 条，需在 ${state.min_cues}～${state.max_cues} 条之间，不能以此开新场`];
+  }
+  const numbers = cues.map((c) => c.number.trim());
+  if (numbers.some((n) => !n)) return ["档案中存在空编号，不能以此开新场"];
+  if (new Set(numbers).size !== numbers.length) return ["合并后编号有重复，不能以此开新场"];
+  if (cues.some((c) => !c.content.trim())) return ["档案中存在空内容，不能以此开新场"];
+  return null;
+}
+
+function openStartConfirm(a) {
+  if (!state || state.status !== "setup") {
+    toast("仅开场前（设置页）可以此开新场");
+    return;
+  }
+  const cues = startCues(a);
+  const issues = startCueIssues(cues);
+  $("#archives-title").textContent = "以此开新场";
+  $("#archives-body").innerHTML = `
+    <p class="hint">
+      将以档案「${escapeHtml(a.name)}」开一场新演出：新场待发提示依次为档案
+      <b>已发 ${a.issued.length} 条</b>（取编号与内容快照，不含发出时间）再接
+      <b>剩余 ${a.pending.length} 条</b>，共 ${cues.length} 条；不继承发出时间或进度，
+      原档案保持不变。成功后直接进入演出中，当前指向第一条。
+    </p>
+    ${issues ? `<p class="form-error">${issues.map(escapeHtml).join("<br>")}</p>` : ""}
+    <ul class="cue-list start-preview">
+      ${cues.map((c, i) => `
+        <li class="${c.src === "issued" ? "issued-item" : "pending-item"}">
+          <span class="row-index">${i + 1}</span>
+          <span class="badge ${c.src === "issued" ? "done" : ""}">${escapeHtml(c.number)}</span>
+          <span class="content">${escapeHtml(c.content)}</span>
+          <span class="tag ${c.src === "issued" ? "done" : "next"}">${c.src === "issued" ? "已发快照" : "待发"}</span>
+        </li>`).join("")}
+    </ul>
+    <p class="hint-inline">提交页面当前版本 v${state.version}；非开场前或版本过期会被服务端拒绝（409）。</p>
+    <div class="actions">
+      <button id="start-submit" class="primary" data-action="start-submit" data-id="${a.id}"
+        ${issues ? "disabled" : ""}>确认开新场 ▶</button>
+      <button data-action="start-cancel" data-id="${a.id}">取消</button>
+    </div>`;
+}
+
+async function submitStartFromArchive(id) {
+  if (startSubmitting) return;
+  startSubmitting = true;
+  const btn = $("#start-submit");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/archives/" + encodeURIComponent(id) + "/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version: state.version }),
+    });
+    const data = await res.json();
+    if (res.status === 409) {
+      applyState(data.state);
+      closeArchivesModal();
+      toast("开新场未生效：非开场前或版本已过期，页面已刷新为最新状态");
+      return;
+    }
+    if (res.status === 404) {
+      toast("档案不存在或已被删除");
+      loadArchiveList();
+      return;
+    }
+    if (!res.ok) {
+      toast(data.error || "开新场失败");
+      loadArchiveDetail(id); // 留在档案详情，允许重试
+      return;
+    }
+    // 新场提示与状态推进已在同一事务落库：进入演出中、已发为空、指向第一条
+    applyState(data);
+    closeArchivesModal();
+    toast("已以此档案开新场，共 " + data.total + " 条待发提示");
+  } catch (err) {
+    toast("网络错误：" + err.message);
+    if (btn) btn.disabled = false;
+  } finally {
+    startSubmitting = false;
+    updateBusy();
+  }
 }
 
 function openArchiveForm() {
@@ -455,6 +562,15 @@ $("#archives-body").addEventListener("click", (e) => {
   } else if (action === "archive-submit") {
     submitArchive();
   } else if (action === "archive-detail") {
+    loadArchiveDetail(Number(btn.dataset.id));
+  } else if (action === "start-from-archive") {
+    const id = Number(btn.dataset.id);
+    apiGetJson("/api/archives/" + encodeURIComponent(id))
+      .then(openStartConfirm)
+      .catch((err) => toast("档案加载失败：" + err.message));
+  } else if (action === "start-submit") {
+    submitStartFromArchive(Number(btn.dataset.id));
+  } else if (action === "start-cancel") {
     loadArchiveDetail(Number(btn.dataset.id));
   }
 });

@@ -254,6 +254,17 @@ button.warning-outline { border-color: var(--accent); color: var(--accent); back
 .modal-head h2 { margin: 0; font-size: 19px; }
 
 .field-label { display: block; margin: 14px 0 6px; color: var(--muted); font-size: 13px; }
+.form-error {
+  color: var(--red);
+  background: rgba(229, 99, 111, .1);
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 12px 0;
+  font-size: 14px;
+}
+.start-preview { margin: 14px 0; max-height: 46vh; overflow-y: auto; }
+.start-preview .row-index { flex: none; width: 20px; }
 
 .archive-list { list-style: none; margin: 16px 0 0; padding: 0; }
 .archive-item {
